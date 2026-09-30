@@ -415,10 +415,36 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
   }
 
   if (providerReference) {
-    const { data: already } = await supabase.from('payment_tickets').select('id,status').eq('provider_reference', providerReference).maybeSingle();
+    const { data: already, error: idempotencyError } = await supabase.from('payment_tickets')
+      .select('id,status,telegram_id,transfer_number,amount_cup')
+      .eq('provider_reference', providerReference)
+      .maybeSingle();
+
+    if (idempotencyError) {
+      void flowLog({ level:'ERROR', stage:'IDEMPOTENCY', status:'DB_ERROR', eventId, details:{ provider_reference:providerReference, error:idempotencyError.message }});
+      return res.status(500).json({ error:'idempotency_lookup_failed' });
+    }
+
     if (already) {
-      void flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'DUPLICATE', eventId, ticketId:already.id, details:{ provider_reference:providerReference, existing_status:already.status }});
-      return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
+      if (already.status === 'paid') {
+        void flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'DUPLICATE_PAID', eventId, ticketId:already.id, telegramId:String(already.telegram_id), details:{ provider_reference:providerReference }});
+        return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
+      }
+
+      if (already.status === 'processing') {
+        void flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'IN_PROGRESS', eventId, ticketId:already.id, telegramId:String(already.telegram_id), details:{ provider_reference:providerReference, existing_status:already.status }});
+        return res.json({ ok: true, duplicate: true, processing: true, ticket_id: already.id, status: already.status });
+      }
+
+      // A pending ticket may already contain a provider_reference because a previous
+      // delivery attempt reached the shop but Telegram failed. In that situation the
+      // same provider event must be allowed to re-enter the delivery path.
+      if (already.status === 'pending') {
+        void flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'RETRY_ALLOWED', eventId, ticketId:already.id, telegramId:String(already.telegram_id), details:{ provider_reference:providerReference, reason:'previous_delivery_failed_and_ticket_was_reset_to_pending' }});
+      } else {
+        void flowLog({ level:'WARN', stage:'IDEMPOTENCY', status:'DUPLICATE_NON_RETRYABLE', eventId, ticketId:already.id, telegramId:String(already.telegram_id), details:{ provider_reference:providerReference, existing_status:already.status }});
+        return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
+      }
     }
   }
 
@@ -504,7 +530,16 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
       telegram_error_code: e?.telegram_error_code || null,
       telegram_description: e?.telegram_description || null,
     };
-    await supabase.from('payment_tickets').update({ status:'pending', last_error:message }).eq('id', claimed.id).eq('status','processing');
+    const { error: resetError } = await supabase.from('payment_tickets').update({
+      status:'pending',
+      provider_reference:null,
+      last_error:message
+    }).eq('id', claimed.id).eq('status','processing');
+    if (resetError) {
+      void flowLog({ level:'ERROR', stage:'TICKET_RESET', status:'DB_ERROR_AFTER_DELIVERY_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:resetError.message }});
+    } else {
+      void flowLog({ stage:'TICKET_RESET', status:'PENDING_RETRY', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ provider_reference_cleared:true }});
+    }
     void flowLog({ level:'ERROR', stage:'TELEGRAM_SEND', status:'FAILED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError, transport:{ keepAlive:false, family:4 } }});
     void flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError }});
     return res.status(502).json({ error:'delivery_failed_retryable', event_id:eventId, detail:message });
