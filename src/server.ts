@@ -40,7 +40,7 @@ const WEBHOOK_MAX_SKEW_SEC = Number(process.env.WEBHOOK_MAX_SKEW_SECONDS || 300)
 const ALLOW_TEST_TELEGRAM_ID = process.env.ALLOW_UNVERIFIED_TELEGRAM_ID === 'true';
 const ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA = process.env.ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA === 'true';
 const MAX_FILE_BYTES = 49 * 1024 * 1024; // Telegram Bot API currently documents 50 MB for sendDocument.
-const BUILD_VERSION = '1.1.4';
+const BUILD_VERSION = '1.1.5';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -126,6 +126,20 @@ function telegramInitDataValid(initData: string) {
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'synthesisone-telegram-shop', version: BUILD_VERSION }));
 app.get('/api/version', (_req, res) => res.json({ ok: true, version: BUILD_VERSION }));
+app.get('/api/admin/diagnostics', adminMiddleware, async (_req, res) => {
+  const result: any = { ok: true, version: BUILD_VERSION, bucket: BUCKET };
+  const { error: plansError } = await supabase.from('plans').select('id').limit(1);
+  const { error: filesError } = await supabase.from('pool_files').select('id').limit(1);
+  result.plans = plansError ? { ok: false, code: plansError.code, message: plansError.message } : { ok: true };
+  result.pool_files = filesError ? { ok: false, code: filesError.code, message: filesError.message } : { ok: true };
+  try {
+    const { data, error } = await supabase.storage.getBucket(BUCKET);
+    result.storage = error ? { ok: false, message: error.message } : { ok: true, id: data?.id || BUCKET, name: data?.name || BUCKET, public: !!data?.public };
+  } catch (e) {
+    result.storage = { ok: false, message: String(e instanceof Error ? e.message : e) };
+  }
+  res.json(result);
+});
 
 app.post('/api/session/bootstrap', (req, res) => {
   const initData = String(req.body?.init_data || '');
@@ -282,18 +296,66 @@ app.post('/api/admin/plans', adminMiddleware, upload.single('file'), async (req,
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   const price = Number(req.body?.price_cup);
+
   if (!name || !Number.isFinite(price) || price <= 0) {
-    if (req.file) fs.rmSync(req.file.path, { force: true });
+    if (req.file?.path) fs.rmSync(req.file.path, { force: true });
     return res.status(400).json({ error: 'name_and_valid_price_required' });
   }
   if (!req.file) return res.status(400).json({ error: 'file_required' });
 
-  const { data: plan, error: planError } = await supabase.from('plans').insert({
+  console.log(`[admin:create-plan] name=${JSON.stringify(name)} price=${price} file=${JSON.stringify(req.file.originalname)}`);
+
+  // El insert se hace primero en una forma compatible con esquemas antiguos.
+  // Algunas instalaciones ya existentes pueden no tener `description`; en ese caso
+  // reintentamos sin esa columna y mostramos una advertencia en la respuesta.
+  let plan: any = null;
+  let planError: any = null;
+  let descriptionSkipped = false;
+
+  const firstInsert = await supabase.from('plans').insert({
     name, price_cup: price, description, active: true
   }).select('*').single();
+  plan = firstInsert.data;
+  planError = firstInsert.error;
+
+  if (planError) {
+    console.error('[admin:create-plan] plans INSERT failed', {
+      code: planError.code,
+      message: planError.message,
+      details: planError.details,
+      hint: planError.hint
+    });
+
+    // Compatibilidad con una tabla `plans` anterior que no tenga `description`.
+    const looksLikeMissingDescription = planError.code === '42703' || /description/i.test(String(planError.message || ''));
+    if (looksLikeMissingDescription) {
+      const retry = await supabase.from('plans').insert({
+        name, price_cup: price, active: true
+      }).select('*').single();
+      plan = retry.data;
+      planError = retry.error;
+      descriptionSkipped = !planError && !!plan;
+      if (planError) {
+        console.error('[admin:create-plan] compatibility INSERT failed', {
+          code: planError.code,
+          message: planError.message,
+          details: planError.details,
+          hint: planError.hint
+        });
+      }
+    }
+  }
+
   if (planError || !plan) {
-    fs.rmSync(req.file.path, { force: true });
-    return res.status(500).json({ error: 'plan_create_failed' });
+    if (req.file?.path) fs.rmSync(req.file.path, { force: true });
+    const code = planError?.code ? String(planError.code) : '';
+    const message = planError?.message ? String(planError.message) : '';
+    const details = planError?.details ? String(planError.details) : '';
+    let error = 'plan_create_failed';
+    if (code === '42501') error = 'supabase_permission_denied';
+    else if (code === '42P01' || /relation .*plans.* does not exist/i.test(message)) error = 'plans_table_missing';
+    else if (code === '42703' || /column .* does not exist/i.test(message)) error = 'plans_schema_mismatch';
+    return res.status(500).json({ error, detail: message || details || 'Supabase rechazó la creación de la oferta.' });
   }
 
   const ext = path.extname(req.file.originalname);
@@ -304,21 +366,33 @@ app.post('/api/admin/plans', adminMiddleware, upload.single('file'), async (req,
       contentType: req.file.mimetype || 'application/octet-stream', upsert: false
     });
     if (upError) {
+      console.error('[admin:create-plan] storage upload failed', {
+        message: upError.message,
+        details: upError.details,
+        hint: upError.hint
+      });
       await supabase.from('plans').delete().eq('id', plan.id);
-      return res.status(500).json({ error: 'storage_upload_failed' });
+      return res.status(500).json({ error: 'storage_upload_failed', detail: String(upError.message || 'No se pudo subir al Storage.') });
     }
 
     const { data: file, error: fileError } = await supabase.from('pool_files').insert({
       plan_id: plan.id, file_name: req.file.originalname, storage_path: storagePath
     }).select('*').single();
     if (fileError || !file) {
+      console.error('[admin:create-plan] pool_files INSERT failed', {
+        code: fileError?.code,
+        message: fileError?.message,
+        details: fileError?.details,
+        hint: fileError?.hint
+      });
       await supabase.storage.from(BUCKET).remove([storagePath]);
       await supabase.from('plans').delete().eq('id', plan.id);
-      return res.status(500).json({ error: 'pool_record_failed' });
+      return res.status(500).json({ error: 'pool_record_failed', detail: String(fileError?.message || 'No se pudo registrar el archivo.') });
     }
-    return res.json({ ok: true, plan, file });
+    console.log(`[admin:create-plan] success plan=${plan.id} file=${file.id}${descriptionSkipped ? ' description_column_missing' : ''}`);
+    return res.json({ ok: true, plan, file, description_skipped: descriptionSkipped });
   } finally {
-    fs.rmSync(req.file.path, { force: true });
+    if (req.file?.path) fs.rmSync(req.file.path, { force: true });
   }
 });
 
