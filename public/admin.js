@@ -5,7 +5,7 @@ function showApp(){document.querySelector('#login').classList.add('hidden');docu
 function showLogin(){document.querySelector('#login').classList.remove('hidden');document.querySelector('#app').classList.add('hidden');}
 async function login(){const password=document.querySelector('#password').value;const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const d=await r.json();if(!r.ok){document.querySelector('#loginResult').textContent='❌ Credenciales inválidas';return;}token=d.token;localStorage.setItem('synth_admin_token',token);showApp();}
 async function logout(){try{await api('/api/admin/logout',{method:'POST'})}catch{}localStorage.removeItem('synth_admin_token');token='';showLogin();}
-async function loadAll(){const [plans,tickets,files]=await Promise.all([api('/api/admin/plans'),api('/api/admin/tickets'),api('/api/admin/files')]);
+async function loadAll(){const [plans,tickets,files,parserStatus]=await Promise.all([api('/api/admin/plans'),api('/api/admin/tickets'),api('/api/admin/files'),api('/api/admin/parser-webhook-status')]);document.querySelector('#parserSecretStatus').textContent=parserStatus.configured?'✅ Secreto configurado':'❌ PARSER_WEBHOOK_SECRET falta en Render';
 document.querySelector('#ticketCount').textContent=`${tickets.length} tickets`;
 document.querySelector('#plans').innerHTML=plans.map(p=>`<article class="plan"><div><span class="file-badge">${p.available_files||0} archivo(s) activos</span><h3>${esc(p.name)}</h3><p>${esc(p.description||'')}</p><p class="plan-meta">Precio actual: <b>${Number(p.price_cup).toFixed(2)} CUP</b></p></div><div class="plan-tools"><input class="name-edit" id="name-${p.id}" value="${esc(p.name)}" maxlength="120"><input id="price-${p.id}" type="number" min="0.01" step="0.01" value="${Number(p.price_cup)}"><button class="tiny" onclick="savePlan('${p.id}')">Guardar oferta</button><label class="upload">+ Añadir archivo<input type="file" onchange="uploadFile('${p.id}',this)"></label></div></article>`).join('');
 document.querySelector('#tickets').innerHTML=tickets.length?tickets.map(t=>`<div class="item"><div><b>${esc(t.plans?.name||t.plan_id)}</b><br>${esc(t.transfer_number)} · ${esc(t.telegram_id)} · ${Number(t.amount_cup).toFixed(2)} CUP<br><small>${esc(t.status)} · ${new Date(t.created_at).toLocaleString()}</small></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="tiny" onclick="testPayment('${t.id}')">Test pago</button><button class="tiny" style="background:#7b2fbe" onclick="testParser('${t.id}')">Test Parser</button></div></div>`).join(''):'<div class="empty">Sin tickets</div>';
@@ -21,7 +21,8 @@ if(token)showApp();else showLogin();
 async function loadFlowLogs(){
   const cont=document.querySelector('#flowLogs'); if(!cont)return;
   try{
-    const logs=await api('/api/admin/payment-flow-logs?limit=250');
+    const rawLogs=await api('/api/admin/payment-flow-logs?limit=250');
+    const logs=Array.isArray(rawLogs)?rawLogs.slice().sort((a,b)=>{const dt=Date.parse(b.created_at||'')-Date.parse(a.created_at||'');if(dt)return dt;return Number(b.id||0)-Number(a.id||0);}):[];
     if(!Array.isArray(logs)||!logs.length){cont.innerHTML='<div class="empty">Sin logs de flujo todavía.</div>';return;}
     cont.innerHTML=logs.map(l=>{
       const level=l.level||'INFO';
