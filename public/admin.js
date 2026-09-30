@@ -1,0 +1,16 @@
+let token=localStorage.getItem('synth_admin_token')||'';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+async function api(path,opt={}){opt.headers={...(opt.headers||{}),Authorization:`Bearer ${token}`};const r=await fetch(path,opt);if(r.status===401){localStorage.removeItem('synth_admin_token');showLogin();throw new Error('auth');}const d=await r.json();if(!r.ok)throw new Error(d.error||'error');return d;}
+function showApp(){document.querySelector('#login').classList.add('hidden');document.querySelector('#app').classList.remove('hidden');loadAll();}
+function showLogin(){document.querySelector('#login').classList.remove('hidden');document.querySelector('#app').classList.add('hidden');}
+async function login(){const password=document.querySelector('#password').value;const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const d=await r.json();if(!r.ok){document.querySelector('#loginResult').textContent='❌ Credenciales inválidas';return;}token=d.token;localStorage.setItem('synth_admin_token',token);showApp();}
+async function logout(){try{await api('/api/admin/logout',{method:'POST'})}catch{}localStorage.removeItem('synth_admin_token');token='';showLogin();}
+async function loadAll(){const [plans,tickets,files]=await Promise.all([api('/api/admin/plans'),api('/api/admin/tickets'),api('/api/admin/files')]);
+document.querySelector('#ticketCount').textContent=`${tickets.length} tickets`;
+document.querySelector('#plans').innerHTML=plans.map(p=>`<article class="plan"><div><small>${esc(p.price_cup)} CUP</small><h3>${esc(p.name)}</h3><p>${esc(p.description)}</p></div><label class="upload">+ Añadir archivo<input type="file" onchange="uploadFile('${p.id}',this)"></label></article>`).join('');
+document.querySelector('#tickets').innerHTML=tickets.length?tickets.map(t=>`<div class="item"><div><b>${esc(t.plans?.name||t.plan_id)}</b><br>${esc(t.transfer_number)} · ${esc(t.telegram_id)} · ${Number(t.amount_cup).toFixed(2)} CUP<br><small>${esc(t.status)} · ${new Date(t.created_at).toLocaleString()}</small></div><button class="tiny" onclick="testPayment('${t.id}')">Test pago</button></div>`).join(''):'<div class="empty">Sin tickets</div>';
+document.querySelector('#files').innerHTML=files.length?files.map(f=>`<div class="item"><div><b>${esc(f.file_name)}</b><br>${esc(f.plans?.name||f.plan_id)} · ${new Date(f.created_at).toLocaleString()}</div><button class="tiny danger" onclick="removeFile('${f.id}')">Eliminar</button></div>`).join(''):'<div class="empty">Sin archivos</div>';}
+async function uploadFile(planId,input){const file=input.files?.[0];if(!file)return;const fd=new FormData();fd.append('file',file);try{await api(`/api/admin/plans/${planId}/files`,{method:'POST',body:fd});await loadAll();}catch(e){alert(e.message)}}
+async function removeFile(id){if(!confirm('¿Eliminar este archivo del pool?'))return;await api(`/api/admin/files/${id}`,{method:'DELETE'});await loadAll();}
+async function testPayment(id){try{const d=await api(`/api/admin/test-payment/${id}`,{method:'POST'});alert(d.ok?'✅ Entrega de prueba realizada.':JSON.stringify(d));await loadAll();}catch(e){alert(e.message)}}
+if(token)showApp();else showLogin();

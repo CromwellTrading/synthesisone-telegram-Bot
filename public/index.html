@@ -1,0 +1,9 @@
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SynthesisOne · Tienda</title><link rel="stylesheet" href="/style.css"><script src="https://telegram.org/js/telegram-web-app.js"></script></head><body><main class="shell">
+<header class="hero"><span class="eyebrow">SYNTHESISONE · TELEGRAM</span><h1>Elige tu plan</h1><p id="who">Conecta con Telegram para comprar y recibir tu archivo.</p></header>
+<section id="plans" class="grid"><div class="loading">Cargando planes…</div></section>
+<section id="checkout" class="panel hidden"><button class="back" onclick="backToPlans()">← Planes</button><div id="chosen"></div>
+<div class="warn"><b>⚠️ Antes de transferir</b><p>En Transfermóvil debes activar <strong>“Mostrar número al destinatario”</strong>. Esto es obligatorio para identificar el pago.</p><label class="check"><input id="read" type="checkbox" onchange="ready()"> Ya leí y acepto esta indicación.</label></div>
+<div id="payment" class="payment">Cargando datos…</div>
+<label>Número desde el que vas a transferir<input id="number" inputmode="numeric" maxlength="15" placeholder="Tu número de transferencia" oninput="ready()"></label>
+<button id="buy" disabled onclick="createTicket()">Crear ticket de pago</button><div id="result" class="result"></div></section>
+</main><script src="/app.js"></script></body></html>
