@@ -18,7 +18,12 @@ const required = (key: string) => {
 };
 
 const PORT = Number(process.env.PORT || 3000);
-const BASE = required('PUBLIC_BASE_URL').replace(/\/$/, '');
+const configuredBase = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, '');
+const renderBase = process.env.RENDER_EXTERNAL_URL?.trim().replace(/\/$/, '');
+const BASE = renderBase || required('PUBLIC_BASE_URL').replace(/\/$/, '');
+if (configuredBase && renderBase && configuredBase !== renderBase) {
+  console.warn(`[webapp] PUBLIC_BASE_URL (${configuredBase}) no coincide con RENDER_EXTERNAL_URL (${renderBase}); se usará RENDER_EXTERNAL_URL.`);
+}
 const ADMIN_TELEGRAM_ID = BigInt(required('ADMIN_TELEGRAM_ID'));
 const ADMIN_PASSWORD = required('ADMIN_PANEL_PASSWORD');
 const SESSION_SECRET = required('SESSION_SECRET');
@@ -35,6 +40,7 @@ const WEBHOOK_MAX_SKEW_SEC = Number(process.env.WEBHOOK_MAX_SKEW_SECONDS || 300)
 const ALLOW_TEST_TELEGRAM_ID = process.env.ALLOW_UNVERIFIED_TELEGRAM_ID === 'true';
 const ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA = process.env.ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA === 'true';
 const MAX_FILE_BYTES = 49 * 1024 * 1024; // Telegram Bot API currently documents 50 MB for sendDocument.
+const BUILD_VERSION = '1.1.4';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -118,7 +124,8 @@ function telegramInitDataValid(initData: string) {
   try { return JSON.parse(userRaw) as { id: number; username?: string; first_name?: string }; } catch { return null; }
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'synthesisone-telegram-shop' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'synthesisone-telegram-shop', version: BUILD_VERSION }));
+app.get('/api/version', (_req, res) => res.json({ ok: true, version: BUILD_VERSION }));
 
 app.post('/api/session/bootstrap', (req, res) => {
   const initData = String(req.body?.init_data || '');
@@ -260,8 +267,81 @@ app.get('/api/admin/files', adminMiddleware, async (_req, res) => {
 });
 app.get('/api/admin/plans', adminMiddleware, async (_req, res) => {
   const { data, error } = await supabase.from('plans').select('*').order('price_cup');
-  if (error) return res.status(500).json({ error: 'plans_unavailable' }); res.json(data || []);
+  if (error) return res.status(500).json({ error: 'plans_unavailable' });
+  const output = [];
+  for (const plan of data || []) {
+    const { count } = await supabase.from('pool_files').select('*', { count: 'exact', head: true }).eq('plan_id', plan.id).eq('active', true);
+    output.push({ ...plan, available_files: count || 0 });
+  }
+  res.json(output);
 });
+
+// Crea una oferta completa desde el panel: nombre + precio + descripción + primer archivo.
+// ADMIN CREATE-OFFER ENDPOINT v1.1.4: multipart/form-data name, price_cup, description, file
+app.post('/api/admin/plans', adminMiddleware, upload.single('file'), async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const price = Number(req.body?.price_cup);
+  if (!name || !Number.isFinite(price) || price <= 0) {
+    if (req.file) fs.rmSync(req.file.path, { force: true });
+    return res.status(400).json({ error: 'name_and_valid_price_required' });
+  }
+  if (!req.file) return res.status(400).json({ error: 'file_required' });
+
+  const { data: plan, error: planError } = await supabase.from('plans').insert({
+    name, price_cup: price, description, active: true
+  }).select('*').single();
+  if (planError || !plan) {
+    fs.rmSync(req.file.path, { force: true });
+    return res.status(500).json({ error: 'plan_create_failed' });
+  }
+
+  const ext = path.extname(req.file.originalname);
+  const storagePath = `${plan.id}/${crypto.randomUUID()}${ext}`;
+  try {
+    const buffer = fs.readFileSync(req.file.path);
+    const { error: upError } = await supabase.storage.from(BUCKET).upload(storagePath, buffer, {
+      contentType: req.file.mimetype || 'application/octet-stream', upsert: false
+    });
+    if (upError) {
+      await supabase.from('plans').delete().eq('id', plan.id);
+      return res.status(500).json({ error: 'storage_upload_failed' });
+    }
+
+    const { data: file, error: fileError } = await supabase.from('pool_files').insert({
+      plan_id: plan.id, file_name: req.file.originalname, storage_path: storagePath
+    }).select('*').single();
+    if (fileError || !file) {
+      await supabase.storage.from(BUCKET).remove([storagePath]);
+      await supabase.from('plans').delete().eq('id', plan.id);
+      return res.status(500).json({ error: 'pool_record_failed' });
+    }
+    return res.json({ ok: true, plan, file });
+  } finally {
+    fs.rmSync(req.file.path, { force: true });
+  }
+});
+
+app.patch('/api/admin/plans/:id', adminMiddleware, async (req, res) => {
+  const id = String(req.params.id);
+  const updates: Record<string, string | number> = {};
+  if (req.body?.name !== undefined) {
+    const name = String(req.body.name).trim();
+    if (!name) return res.status(400).json({ error: 'invalid_plan_name' });
+    updates.name = name;
+  }
+  if (req.body?.price_cup !== undefined) {
+    const price = Number(req.body.price_cup);
+    if (!Number.isFinite(price) || price <= 0) return res.status(400).json({ error: 'invalid_plan_price' });
+    updates.price_cup = price;
+  }
+  if (req.body?.description !== undefined) updates.description = String(req.body.description).trim();
+  if (!Object.keys(updates).length) return res.status(400).json({ error: 'no_changes' });
+  const { data, error } = await supabase.from('plans').update(updates).eq('id', id).select('*').single();
+  if (error || !data) return res.status(404).json({ error: 'plan_update_failed' });
+  res.json(data);
+});
+
 app.post('/api/admin/plans/:id/files', adminMiddleware, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'file_required' });
   const planId = String(req.params.id);
@@ -300,6 +380,12 @@ app.post('/api/admin/test-payment/:ticketId', adminMiddleware, async (req, res) 
   } catch (error) { res.status(502).json({ error: String(error) }); }
 });
 
+app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof multer.MulterError) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'file_too_large_max_49mb' : `upload_${err.code}` });
+  if (err) return res.status(500).json({ error: 'internal_server_error' });
+  next(err);
+});
+
 bot.start(async ctx => {
   const url = `${BASE}/`;
   await ctx.reply('🛍️ *SynthesisOne*\n\nElige tu plan y completa el pago desde la tienda.', { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.webApp('🛒 Abrir tienda', url)]]) });
@@ -318,7 +404,7 @@ setInterval(async () => {
 }, 60_000).unref();
 
 app.listen(PORT, () => {
-  console.log(`SynthesisOne Telegram shop listening on ${PORT}`);
+  console.log(`SynthesisOne Telegram shop v${BUILD_VERSION} listening on ${PORT}`);
   console.log(`Public directory: ${PUBLIC_DIR}`);
   console.log(`Webapp: ${BASE}/`);
   console.log(`Admin: ${BASE}/admin`);
