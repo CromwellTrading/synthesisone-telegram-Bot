@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
@@ -40,9 +41,14 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const app = express();
 app.set('trust proxy', 1);
 
+const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.resolve(APP_DIR, '..', 'public');
+
 app.use(express.json({ verify: (req, _res, buf) => { (req as AuthedRequest).rawBody = Buffer.from(buf); } }));
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(process.cwd(), 'public'), { extensions: ['html'] }));
+app.use(express.static(PUBLIC_DIR, { extensions: ['html'] }));
+app.get('/', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
+app.get('/admin', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin.html')));
 
 const uploadDir = path.join(process.cwd(), '.uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -311,7 +317,12 @@ setInterval(async () => {
   for (const [token, exp] of adminSessions) if (exp <= Date.now()) adminSessions.delete(token);
 }, 60_000).unref();
 
-app.listen(PORT, () => console.log(`SynthesisOne Telegram shop listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`SynthesisOne Telegram shop listening on ${PORT}`);
+  console.log(`Public directory: ${PUBLIC_DIR}`);
+  console.log(`Webapp: ${BASE}/`);
+  console.log(`Admin: ${BASE}/admin`);
+});
 bot.launch().catch(console.error);
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
