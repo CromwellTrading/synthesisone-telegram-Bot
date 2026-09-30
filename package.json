@@ -1,6 +1,6 @@
 {
   "name": "synthesisone-telegram-shop",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,13 +12,13 @@
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "multer": "^2.0.2",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "tsx": "^4.20.5"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/multer": "^2.0.0",
     "@types/node": "^24.5.2",
-    "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   },
   "engines": {
