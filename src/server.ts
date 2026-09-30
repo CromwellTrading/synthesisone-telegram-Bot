@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import https from 'node:https';
+import dns from 'node:dns/promises';
 import { createClient } from '@supabase/supabase-js';
 import { Markup, Telegraf } from 'telegraf';
 import type { Request, Response, NextFunction } from 'express';
@@ -42,10 +44,19 @@ const PARSER_WEBHOOK_SECRET = process.env.PARSER_WEBHOOK_SECRET?.trim() || '';
 const ALLOW_TEST_TELEGRAM_ID = process.env.ALLOW_UNVERIFIED_TELEGRAM_ID === 'true';
 const ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA = process.env.ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA === 'true';
 const MAX_FILE_BYTES = 49 * 1024 * 1024; // Telegram Bot API currently documents 50 MB for sendDocument.
-const BUILD_VERSION = '1.3.0';
+const BUILD_VERSION = '1.3.2';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+// Telegram transport hardening: avoid stale keep-alive sockets and prefer IPv4.
+// This only affects outbound Bot API calls; webhook handling remains unchanged.
+const telegramAgent = new https.Agent({
+  keepAlive: false,
+  maxSockets: 10,
+  maxFreeSockets: 0,
+  timeout: 30_000,
+  family: 4,
+});
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: { agent: telegramAgent } });
 const app = express();
 app.set('trust proxy', 1);
 
@@ -372,9 +383,22 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
     await flowLog({ stage:'TICKET_FINALIZE', status:'PAID', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ delivered_file_id:file.id, telegram_message_id:sent.message_id }});
     return res.json({ ok: true, ticket_id: claimed.id, telegram_message_id: sent.message_id, delivered_file_id: file.id, event_id:eventId });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const e = error as any;
+    const message = e?.message || String(error);
+    const transportError = {
+      name: e?.name || 'Error',
+      message,
+      code: e?.code || null,
+      errno: e?.errno || null,
+      syscall: e?.syscall || null,
+      address: e?.address || null,
+      port: e?.port || null,
+      type: e?.type || null,
+      cause: e?.cause ? String(e.cause?.message || e.cause) : null,
+    };
     await supabase.from('payment_tickets').update({ status:'pending', last_error:message }).eq('id', claimed.id).eq('status','processing');
-    await flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:message }});
+    await flowLog({ level:'ERROR', stage:'TELEGRAM_SEND', status:'FAILED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError, transport:{ keepAlive:false, family:4 } }});
+    await flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError }});
     return res.status(502).json({ error:'delivery_failed_retryable', event_id:eventId, detail:message });
   }
 });
@@ -387,6 +411,45 @@ app.post('/api/admin/login', async (req, res) => {
   res.json({ ok: true, token });
 });
 app.post('/api/admin/logout', adminMiddleware, (req: AuthedRequest, res) => { if (req.adminSession) adminSessions.delete(req.adminSession); res.json({ ok: true }); });
+app.get('/api/admin/telegram-diagnostic', adminMiddleware, async (_req, res) => {
+  const started = Date.now();
+  const details: Record<string, unknown> = {
+    api_host: 'api.telegram.org',
+    agent: { keepAlive: false, family: 4, timeout_ms: 30000 },
+  };
+  try {
+    const addresses = await dns.lookup('api.telegram.org', { all: true });
+    details.resolved_addresses = addresses.map((x) => ({ address: x.address, family: x.family }));
+  } catch (e) {
+    details.dns_error = e instanceof Error ? e.message : String(e);
+  }
+  try {
+    const me = await bot.telegram.getMe();
+    details.telegram_status = 'OK';
+    details.bot_id = me.id;
+    details.bot_username = me.username || null;
+    await flowLog({ stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_SUCCESS', details: { ...details, elapsed_ms: Date.now() - started } });
+    return res.json({ ok: true, elapsed_ms: Date.now() - started, details });
+  } catch (error) {
+    const e = error as any;
+    const err = {
+      name: e?.name || 'Error',
+      message: e?.message || String(error),
+      code: e?.code || null,
+      errno: e?.errno || null,
+      syscall: e?.syscall || null,
+      address: e?.address || null,
+      port: e?.port || null,
+      type: e?.type || null,
+      cause: e?.cause ? String(e.cause?.message || e.cause) : null,
+    };
+    details.telegram_status = 'ERROR';
+    details.error = err;
+    await flowLog({ level: 'ERROR', stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_FAILED', details: { ...details, elapsed_ms: Date.now() - started } });
+    return res.status(502).json({ ok: false, elapsed_ms: Date.now() - started, details });
+  }
+});
+
 app.get('/api/admin/payment-flow-logs', adminMiddleware, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   let query = supabase.from('payment_flow_logs').select('*').order('created_at', { ascending:false }).limit(limit);
@@ -400,6 +463,15 @@ app.get('/api/admin/tickets', adminMiddleware, async (_req, res) => {
   const { data, error } = await supabase.from('payment_tickets').select('*,plans(name,price_cup)').order('created_at', { ascending: false }).limit(300);
   if (error) return res.status(500).json({ error: 'tickets_unavailable' }); res.json(data || []);
 });
+app.get('/api/admin/parser-webhook-status', adminMiddleware, (_req, res) => {
+  res.json({
+    configured: Boolean(PARSER_WEBHOOK_SECRET),
+    mode: 'parser-bot',
+    endpoint: '/api/payments/incoming',
+    accepted_headers: ['X-Webhook-Event-Id','X-Webhook-Timestamp','X-Webhook-Signature','X-Webhook-Signature-V2']
+  });
+});
+
 app.get('/api/admin/files', adminMiddleware, async (_req, res) => {
   const { data, error } = await supabase.from('pool_files').select('*,plans(name,price_cup)').order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: 'files_unavailable' }); res.json(data || []);
