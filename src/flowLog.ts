@@ -12,7 +12,9 @@ function safeDetails(details: Record<string, unknown> = {}) {
   return out;
 }
 
-export async function flowLog(input: {
+let persistQueue = Promise.resolve();
+
+export function flowLog(input: {
   level?: FlowLevel;
   stage: string;
   status?: string;
@@ -23,6 +25,7 @@ export async function flowLog(input: {
   details?: Record<string, unknown>;
 }) {
   const level = input.level || 'INFO';
+  const safe = safeDetails(input.details || {});
   const entry = {
     ts: new Date().toISOString(),
     service: 'synthesisone-telegram-shop',
@@ -34,26 +37,30 @@ export async function flowLog(input: {
     event_id: input.eventId || null,
     ticket_id: input.ticketId || null,
     telegram_id: input.telegramId || null,
-    ...safeDetails(input.details || {}),
+    ...safe,
   };
   const line = JSON.stringify(entry);
   if (level === 'ERROR') console.error(line);
   else if (level === 'WARN') console.warn(line);
   else console.log(line);
 
-  try {
-    const { error } = await supabase.from('payment_flow_logs').insert({
-      level,
-      stage: input.stage,
-      status: input.status || null,
-      event: input.event || null,
-      event_id: input.eventId || null,
-      ticket_id: input.ticketId || null,
-      telegram_id: input.telegramId || null,
-      details: safeDetails(input.details || {}),
-    });
-    if (error) console.error(JSON.stringify({ ts: new Date().toISOString(), service: 'synthesisone-telegram-shop', subsystem: 'payment-flow', level: 'ERROR', stage: 'PERSIST_LOG_FAILED', error: error.message }));
-  } catch (error) {
-    console.error(JSON.stringify({ ts: new Date().toISOString(), service: 'synthesisone-telegram-shop', subsystem: 'payment-flow', level: 'ERROR', stage: 'PERSIST_LOG_EXCEPTION', error: error instanceof Error ? error.message : String(error) }));
-  }
+  const row = {
+    level,
+    stage: input.stage,
+    status: input.status || null,
+    event: input.event || null,
+    event_id: input.eventId || null,
+    ticket_id: input.ticketId || null,
+    telegram_id: input.telegramId || null,
+    details: safe,
+  };
+  persistQueue = persistQueue.then(async () => {
+    try {
+      const { error } = await supabase.from('payment_flow_logs').insert(row);
+      if (error) console.error(JSON.stringify({ ts: new Date().toISOString(), service: 'synthesisone-telegram-shop', subsystem: 'payment-flow', level: 'ERROR', stage: 'PERSIST_LOG_FAILED', error: error.message }));
+    } catch (error) {
+      console.error(JSON.stringify({ ts: new Date().toISOString(), service: 'synthesisone-telegram-shop', subsystem: 'payment-flow', level: 'ERROR', stage: 'PERSIST_LOG_EXCEPTION', error: error instanceof Error ? error.message : String(error) }));
+    }
+  }).catch(() => undefined);
+  return persistQueue;
 }

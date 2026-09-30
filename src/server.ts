@@ -44,19 +44,120 @@ const PARSER_WEBHOOK_SECRET = process.env.PARSER_WEBHOOK_SECRET?.trim() || '';
 const ALLOW_TEST_TELEGRAM_ID = process.env.ALLOW_UNVERIFIED_TELEGRAM_ID === 'true';
 const ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA = process.env.ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA === 'true';
 const MAX_FILE_BYTES = 49 * 1024 * 1024; // Telegram Bot API currently documents 50 MB for sendDocument.
-const BUILD_VERSION = '1.3.2';
+const BUILD_VERSION = '1.4.0';
+const TELEGRAM_HTTP_TIMEOUT_MS = Number(process.env.TELEGRAM_HTTP_TIMEOUT_MS || 8000);
+const TELEGRAM_API_HOST = 'api.telegram.org';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // Telegram transport hardening: avoid stale keep-alive sockets and prefer IPv4.
 // This only affects outbound Bot API calls; webhook handling remains unchanged.
 const telegramAgent = new https.Agent({
   keepAlive: false,
-  maxSockets: 10,
+  maxSockets: 20,
   maxFreeSockets: 0,
-  timeout: 30_000,
+  timeout: TELEGRAM_HTTP_TIMEOUT_MS,
   family: 4,
+  maxCachedSessions: 0,
 });
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: { agent: telegramAgent } });
+
+type TelegramApiResult<T> = { ok: true; result: T } | { ok: false; description?: string; error_code?: number };
+
+function requestTelegramApi<T>(method: string, body?: Buffer, contentType?: string): Promise<T> {
+  return new Promise(async (resolve, reject) => {
+    let addresses: Array<{ address: string; family: number }> = [];
+    try {
+      addresses = await dns.lookup(TELEGRAM_API_HOST, { all: true, family: 4 });
+      addresses = addresses.filter((x) => x.family === 4);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    if (!addresses.length) {
+      reject(Object.assign(new Error('No IPv4 address resolved for api.telegram.org'), { code: 'ENOTFOUND', syscall: 'dns' }));
+      return;
+    }
+
+    let lastError: unknown = null;
+    for (const target of addresses) {
+      try {
+        const result = await new Promise<T>((resolveRequest, rejectRequest) => {
+          const req = https.request({
+            protocol: 'https:',
+            hostname: target.address,
+            port: 443,
+            method: body ? 'POST' : 'GET',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+            servername: TELEGRAM_API_HOST,
+            family: 4,
+            agent: telegramAgent,
+            headers: {
+              Host: TELEGRAM_API_HOST,
+              Accept: 'application/json',
+              Connection: 'close',
+              ...(contentType ? { 'Content-Type': contentType } : {}),
+              ...(body ? { 'Content-Length': String(body.length) } : {}),
+            },
+          }, response => {
+            const chunks: Buffer[] = [];
+            response.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            response.on('end', () => {
+              const raw = Buffer.concat(chunks).toString('utf8');
+              let parsed: TelegramApiResult<T> | null = null;
+              try { parsed = JSON.parse(raw) as TelegramApiResult<T>; } catch {
+                parsed = null;
+              }
+              if (!parsed || parsed.ok !== true) {
+                const err = Object.assign(new Error(parsed && 'description' in parsed ? String(parsed.description || `Telegram HTTP ${response.statusCode || 0}`) : `Telegram returned invalid JSON (HTTP ${response.statusCode || 0})`), {
+                  code: `TELEGRAM_HTTP_${response.statusCode || 0}`,
+                  telegram_error_code: parsed && 'error_code' in parsed ? parsed.error_code : null,
+                  telegram_description: parsed && 'description' in parsed ? parsed.description : null,
+                  http_status: response.statusCode || 0,
+                  response_body: raw.slice(0, 2000),
+                  telegram_ip: target.address,
+                });
+                rejectRequest(err);
+                return;
+              }
+              resolveRequest(parsed.result);
+            });
+          });
+
+          req.setTimeout(TELEGRAM_HTTP_TIMEOUT_MS, () => {
+            req.destroy(Object.assign(new Error(`Telegram API timeout after ${TELEGRAM_HTTP_TIMEOUT_MS}ms`), { code: 'ETIMEDOUT', telegram_ip: target.address }));
+          });
+          req.on('error', error => {
+            const e = error as any;
+            if (e && !e.telegram_ip) e.telegram_ip = target.address;
+            rejectRequest(error);
+          });
+          if (body) req.write(body);
+          req.end();
+        });
+        return resolve(result);
+      } catch (error) {
+        lastError = error;
+        const code = String((error as any)?.code || '');
+        if (!['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code)) break;
+      }
+    }
+    reject(lastError || new Error('Telegram API request failed'));
+  });
+}
+
+function makeMultipartDocument(chatId: string, caption: string, filename: string, bytes: Buffer) {
+  const boundary = `----SynthesisOne${crypto.randomBytes(12).toString('hex')}`;
+  const part = (name: string, value: string) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf8');
+  const fileHeader = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${filename.replace(/[\r\n\"]/g, '_')}"\r\nContent-Type: application/octet-stream\r\n\r\n`, 'utf8');
+  const end = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+  const body = Buffer.concat([part('chat_id', chatId), part('caption', caption), fileHeader, bytes, end]);
+  return { body, contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+async function sendTelegramDocument(chatId: string, filename: string, bytes: Buffer, caption: string) {
+  const { body, contentType } = makeMultipartDocument(chatId, caption, filename, bytes);
+  return requestTelegramApi<any>('sendDocument', body, contentType);
+}
 const app = express();
 app.set('trust proxy', 1);
 
@@ -288,15 +389,15 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
   const recipientCard = normalizeDigits(isParserEvent ? (transaction.receiver_account || body.merchant_accounts?.card1 || '') : (body.recipient_card || ''));
   const confirmationPhone = normalizeDigits(isParserEvent ? (transaction.receiver_phone || '') : (body.confirmation_phone || ''));
 
-  await flowLog({ stage:'WEBHOOK_EVENT', status:'RECEIVED', event:body.event || null, eventId, details:{ provider, is_parser_event:isParserEvent, transfer_number:transferNumber, amount, provider_reference:providerReference || null, recipient_card:recipientCard || null, confirmation_phone:confirmationPhone || null, raw_keys:Object.keys(body).sort() }});
+  void flowLog({ stage:'WEBHOOK_EVENT', status:'RECEIVED', event:body.event || null, eventId, details:{ provider, is_parser_event:isParserEvent, transfer_number:transferNumber, amount, provider_reference:providerReference || null, recipient_card:recipientCard || null, confirmation_phone:confirmationPhone || null, raw_keys:Object.keys(body).sort() }});
 
   if (isParserEvent && body.event !== 'TRANSFER_DETECTED') {
-    await flowLog({ level:'INFO', stage:'WEBHOOK_EVENT', status:'IGNORED', event:body.event || null, eventId, details:{ reason:'not_transfer_detected' }});
+    void flowLog({ level:'INFO', stage:'WEBHOOK_EVENT', status:'IGNORED', event:body.event || null, eventId, details:{ reason:'not_transfer_detected' }});
     return res.json({ ok:true, ignored:true, event:body.event || null });
   }
 
   if (!validTransferNumber(transferNumber) || !Number.isFinite(amount) || amount <= 0) {
-    await flowLog({ level:'ERROR', stage:'PAYMENT_VALIDATION', status:'REJECTED', event:body.event || null, eventId, details:{ transfer_number:transferNumber, amount }});
+    void flowLog({ level:'ERROR', stage:'PAYMENT_VALIDATION', status:'REJECTED', event:body.event || null, eventId, details:{ transfer_number:transferNumber, amount }});
     return res.status(400).json({ error: 'invalid_payment_event' });
   }
 
@@ -304,11 +405,11 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
   // tied to the merchant client and carry merchant_accounts metadata when available.
   if (!isParserEvent && !ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA) {
     if (!recipientCard || !confirmationPhone) {
-      await flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_DATA', eventId, details:{ reason:'recipient_data_required' }});
+      void flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_DATA', eventId, details:{ reason:'recipient_data_required' }});
       return res.status(400).json({ error: 'recipient_data_required' });
     }
     if (recipientCard !== normalizeDigits(PAYMENT_CARD) || confirmationPhone !== normalizeDigits(PAYMENT_CONFIRMATION_NUMBER)) {
-      await flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_MISMATCH', eventId, details:{ recipient_card:recipientCard, confirmation_phone:confirmationPhone }});
+      void flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_MISMATCH', eventId, details:{ recipient_card:recipientCard, confirmation_phone:confirmationPhone }});
       return res.status(400).json({ error: 'recipient_mismatch' });
     }
   }
@@ -316,14 +417,14 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
   if (providerReference) {
     const { data: already } = await supabase.from('payment_tickets').select('id,status').eq('provider_reference', providerReference).maybeSingle();
     if (already) {
-      await flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'DUPLICATE', eventId, ticketId:already.id, details:{ provider_reference:providerReference, existing_status:already.status }});
+      void flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'DUPLICATE', eventId, ticketId:already.id, details:{ provider_reference:providerReference, existing_status:already.status }});
       return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
     }
   }
 
   const customer = (await supabase.from('customers').select('telegram_id,transfer_number').eq('transfer_number', transferNumber).maybeSingle()).data;
   if (!customer) {
-    await flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'CUSTOMER_NOT_FOUND', eventId, details:{ transfer_number:transferNumber, amount }});
+    void flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'CUSTOMER_NOT_FOUND', eventId, details:{ transfer_number:transferNumber, amount }});
     return res.status(404).json({ error: 'transfer_number_unknown' });
   }
 
@@ -333,25 +434,25 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
     .eq('status', 'pending').eq('telegram_id', String(customer.telegram_id)).eq('transfer_number', transferNumber).eq('amount_cup', amount)
     .gte('created_at', minDate).gt('expires_at', now.toISOString()).order('created_at', { ascending: true }).limit(1);
   if (ticketFindError) {
-    await flowLog({ level:'ERROR', stage:'TICKET_MATCH', status:'DB_ERROR', eventId, details:{ error:ticketFindError.message }});
+    void flowLog({ level:'ERROR', stage:'TICKET_MATCH', status:'DB_ERROR', eventId, details:{ error:ticketFindError.message }});
     return res.status(500).json({ error: 'ticket_lookup_failed' });
   }
   const ticket = tickets?.[0];
   if (!ticket) {
-    await flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'NO_PENDING_MATCH', eventId, telegramId:String(customer.telegram_id), details:{ transfer_number:transferNumber, amount, window_minutes:WINDOW_MIN }});
+    void flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'NO_PENDING_MATCH', eventId, telegramId:String(customer.telegram_id), details:{ transfer_number:transferNumber, amount, window_minutes:WINDOW_MIN }});
     return res.status(404).json({ error: 'no_matching_pending_ticket' });
   }
 
-  await flowLog({ stage:'TICKET_MATCH', status:'MATCHED', eventId, ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ transfer_number:transferNumber, amount, plan_id:ticket.plan_id, ticket_created_at:ticket.created_at }});
+  void flowLog({ stage:'TICKET_MATCH', status:'MATCHED', eventId, ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ transfer_number:transferNumber, amount, plan_id:ticket.plan_id, ticket_created_at:ticket.created_at }});
 
   const { data: claimed, error: claimError } = await supabase.from('payment_tickets').update({
     status: 'processing', provider_reference: providerReference || null, delivery_attempts: (ticket.delivery_attempts || 0) + 1
   }).eq('id', ticket.id).eq('status', 'pending').select('*').single();
   if (claimError || !claimed) {
-    await flowLog({ level:'WARN', stage:'TICKET_CLAIM', status:'ALREADY_CLAIMED', eventId, ticketId:ticket.id, details:{ error:claimError?.message || 'no_row_updated' }});
+    void flowLog({ level:'WARN', stage:'TICKET_CLAIM', status:'ALREADY_CLAIMED', eventId, ticketId:ticket.id, details:{ error:claimError?.message || 'no_row_updated' }});
     return res.status(409).json({ error: 'ticket_already_claimed' });
   }
-  await flowLog({ stage:'TICKET_CLAIM', status:'PROCESSING', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ provider_reference:providerReference }});
+  void flowLog({ stage:'TICKET_CLAIM', status:'PROCESSING', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ provider_reference:providerReference }});
 
   try {
     const { data: files, error: filesError } = await supabase.from('pool_files').select('*').eq('plan_id', claimed.plan_id).eq('active', true).order('created_at');
@@ -359,28 +460,31 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
     const available = files || [];
     if (!available.length) throw new Error('No file available for this plan');
     const file = available[Math.floor(Math.random() * available.length)];
-    await flowLog({ stage:'FILE_SELECTION', status:'SELECTED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name, storage_path:file.storage_path, available_count:available.length }});
+    void flowLog({ stage:'FILE_SELECTION', status:'SELECTED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name, storage_path:file.storage_path, available_count:available.length }});
 
     const { data: blob, error: storageError } = await supabase.storage.from(BUCKET).download(file.storage_path);
     if (storageError || !blob) throw new Error(storageError?.message || 'Pool file unavailable');
     const bytes = Buffer.from(await blob.arrayBuffer());
-    await flowLog({ stage:'FILE_DOWNLOAD', status:'READY', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, bytes:bytes.length }});
+    void flowLog({ stage:'FILE_DOWNLOAD', status:'READY', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, bytes:bytes.length }});
 
-    await flowLog({ stage:'TELEGRAM_SEND', status:'START', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name }});
-    const sent = await bot.telegram.sendDocument(String(claimed.telegram_id), {
-      source: bytes, filename: file.file_name
-    }, { caption: `✅ Pago confirmado · ${Number(claimed.amount_cup).toFixed(2)} CUP\nPlan: ${claimed.plan_id}` });
+    void flowLog({ stage:'TELEGRAM_SEND', status:'START', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name, transport:'node_https_request', timeout_ms:TELEGRAM_HTTP_TIMEOUT_MS }});
+    const sent = await sendTelegramDocument(
+      String(claimed.telegram_id),
+      file.file_name,
+      bytes,
+      `✅ Pago confirmado · ${Number(claimed.amount_cup).toFixed(2)} CUP\nPlan: ${claimed.plan_id}`
+    );
 
-    await flowLog({ stage:'TELEGRAM_SEND', status:'SUCCESS', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ telegram_message_id:sent.message_id, file_id:file.id }});
+    void flowLog({ stage:'TELEGRAM_SEND', status:'SUCCESS', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ telegram_message_id:sent.message_id, file_id:file.id, transport:'node_https_request' }});
 
     const { error: paidError } = await supabase.from('payment_tickets').update({
       status: 'paid', paid_at: now.toISOString(), delivered_file_id: file.id, last_error: null
     }).eq('id', claimed.id).eq('status', 'processing');
     if (paidError) {
-      await flowLog({ level:'ERROR', stage:'TICKET_FINALIZE', status:'DB_ERROR_AFTER_TELEGRAM', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:paidError.message }});
+      void flowLog({ level:'ERROR', stage:'TICKET_FINALIZE', status:'DB_ERROR_AFTER_TELEGRAM', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:paidError.message }});
       throw paidError;
     }
-    await flowLog({ stage:'TICKET_FINALIZE', status:'PAID', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ delivered_file_id:file.id, telegram_message_id:sent.message_id }});
+    void flowLog({ stage:'TICKET_FINALIZE', status:'PAID', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ delivered_file_id:file.id, telegram_message_id:sent.message_id }});
     return res.json({ ok: true, ticket_id: claimed.id, telegram_message_id: sent.message_id, delivered_file_id: file.id, event_id:eventId });
   } catch (error) {
     const e = error as any;
@@ -395,10 +499,14 @@ app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) =>
       port: e?.port || null,
       type: e?.type || null,
       cause: e?.cause ? String(e.cause?.message || e.cause) : null,
+      telegram_ip: e?.telegram_ip || null,
+      http_status: e?.http_status || null,
+      telegram_error_code: e?.telegram_error_code || null,
+      telegram_description: e?.telegram_description || null,
     };
     await supabase.from('payment_tickets').update({ status:'pending', last_error:message }).eq('id', claimed.id).eq('status','processing');
-    await flowLog({ level:'ERROR', stage:'TELEGRAM_SEND', status:'FAILED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError, transport:{ keepAlive:false, family:4 } }});
-    await flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError }});
+    void flowLog({ level:'ERROR', stage:'TELEGRAM_SEND', status:'FAILED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError, transport:{ keepAlive:false, family:4 } }});
+    void flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:transportError }});
     return res.status(502).json({ error:'delivery_failed_retryable', event_id:eventId, detail:message });
   }
 });
@@ -424,11 +532,11 @@ app.get('/api/admin/telegram-diagnostic', adminMiddleware, async (_req, res) => 
     details.dns_error = e instanceof Error ? e.message : String(e);
   }
   try {
-    const me = await bot.telegram.getMe();
+    const me = await requestTelegramApi<any>('getMe');
     details.telegram_status = 'OK';
     details.bot_id = me.id;
     details.bot_username = me.username || null;
-    await flowLog({ stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_SUCCESS', details: { ...details, elapsed_ms: Date.now() - started } });
+    void flowLog({ stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_SUCCESS', details: { ...details, elapsed_ms: Date.now() - started } });
     return res.json({ ok: true, elapsed_ms: Date.now() - started, details });
   } catch (error) {
     const e = error as any;
@@ -445,14 +553,14 @@ app.get('/api/admin/telegram-diagnostic', adminMiddleware, async (_req, res) => 
     };
     details.telegram_status = 'ERROR';
     details.error = err;
-    await flowLog({ level: 'ERROR', stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_FAILED', details: { ...details, elapsed_ms: Date.now() - started } });
+    void flowLog({ level: 'ERROR', stage: 'TELEGRAM_DIAGNOSTIC', status: 'GETME_FAILED', details: { ...details, elapsed_ms: Date.now() - started } });
     return res.status(502).json({ ok: false, elapsed_ms: Date.now() - started, details });
   }
 });
 
 app.get('/api/admin/payment-flow-logs', adminMiddleware, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
-  let query = supabase.from('payment_flow_logs').select('*').order('created_at', { ascending:false }).limit(limit);
+  let query = supabase.from('payment_flow_logs').select('*').order('created_at', { ascending:false }).order('id', { ascending:false }).limit(limit);
   if (req.query.ticket_id) query = query.eq('ticket_id', String(req.query.ticket_id));
   if (req.query.event_id) query = query.eq('event_id', String(req.query.event_id));
   const { data, error } = await query;
