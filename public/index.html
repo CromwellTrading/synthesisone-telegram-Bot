@@ -2,8 +2,8 @@
 <header class="hero"><span class="eyebrow">SYNTHESISONE · TELEGRAM</span><h1>Elige tu oferta</h1><p id="who">Elige una oferta, realiza el pago y recibe tu archivo automáticamente.</p></header>
 <section id="plans" class="grid"><div class="loading">Cargando planes…</div></section>
 <section id="checkout" class="panel hidden"><button class="back" onclick="backToPlans()">← Planes</button><div id="chosen"></div>
-<div class="warn"><b>⚠️ Antes de transferir</b><p>En Transfermóvil debes activar <strong>“Mostrar número al destinatario”</strong>. Esto es obligatorio para identificar el pago.</p><label class="check"><input id="read" type="checkbox" onchange="ready()"> Ya leí y acepto esta indicación.</label></div>
+<div class="warn"><b>⚠️ Antes de transferir</b><p><strong>Primero crea el ticket de pago y después realiza la transferencia.</strong><br>En Transfermóvil debes activar <strong>“Mostrar número al destinatario”</strong>. Esto es obligatorio para identificar el pago.</p><label class="check"><input id="read" type="checkbox" onchange="ready()"> Ya leí y acepto esta indicación.</label></div>
 <div id="payment" class="payment">Cargando datos…</div>
-<label>Número desde el que vas a transferir<input id="number" inputmode="numeric" maxlength="15" placeholder="Tu número de transferencia" oninput="ready()"></label>
+<label>Número desde el que vas a transferir<input id="number" inputmode="numeric" maxlength="15" placeholder="Ej: 5XXXXXXX" oninput="ready()"><small>Este debe ser el número desde el que harás la transferencia.</small></label>
 <button id="buy" disabled onclick="createTicket()">Crear ticket de pago</button><div id="result" class="result"></div></section>
 </main><script src="/app.js"></script></body></html>
