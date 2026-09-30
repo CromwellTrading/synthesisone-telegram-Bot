@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import { Markup, Telegraf } from 'telegraf';
 import type { Request, Response, NextFunction } from 'express';
+import { flowLog } from './flowLog.js';
 
 type AuthedRequest = Request & { adminSession?: string; rawBody?: Buffer };
 
@@ -37,11 +38,11 @@ const PAYMENT_BANK_NAME = process.env.PAYMENT_BANK_NAME || 'Transfermóvil';
 const WINDOW_MIN = Number(process.env.TRANSFER_MATCH_WINDOW_MINUTES || 30);
 const TICKET_TTL_MIN = Number(process.env.TICKET_TTL_MINUTES || WINDOW_MIN);
 const WEBHOOK_MAX_SKEW_SEC = Number(process.env.WEBHOOK_MAX_SKEW_SECONDS || 300);
+const PARSER_WEBHOOK_SECRET = process.env.PARSER_WEBHOOK_SECRET?.trim() || '';
 const ALLOW_TEST_TELEGRAM_ID = process.env.ALLOW_UNVERIFIED_TELEGRAM_ID === 'true';
 const ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA = process.env.ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA === 'true';
-const PARSER_WEBHOOK_SECRET = (process.env.PARSER_WEBHOOK_SECRET || '').trim();
 const MAX_FILE_BYTES = 49 * 1024 * 1024; // Telegram Bot API currently documents 50 MB for sendDocument.
-const BUILD_VERSION = '1.2.0';
+const BUILD_VERSION = '1.3.0';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -63,16 +64,14 @@ const upload = multer({ dest: uploadDir, limits: { fileSize: MAX_FILE_BYTES } })
 const adminSessions = new Map<string, number>();
 
 const normalizeDigits = (s: unknown) => String(s ?? '').replace(/\D/g, '');
-const normalizeCubaPhone = (s: unknown) => {
-  const digits = normalizeDigits(s);
-  return digits.length === 10 && digits.startsWith('53') ? digits.slice(2) : digits;
-};
-const transferNumberCandidates = (s: unknown) => {
-  const raw = normalizeDigits(s);
-  const normalized = normalizeCubaPhone(raw);
-  return [...new Set([normalized, raw].filter(Boolean))];
-};
-const validTransferNumber = (s: unknown) => /^[0-9]{6,15}$/.test(normalizeDigits(s));
+function normalizeTransferNumber(s: unknown) {
+  let value = normalizeDigits(s);
+  // Parser-bot may report Cuban mobile numbers as +53XXXXXXXX or 53XXXXXXXX.
+  if (value.startsWith('535') && value.length === 11) value = value.slice(3);
+  else if (value.startsWith('53') && value.length === 10) value = value.slice(2);
+  return value;
+}
+const validTransferNumber = (s: unknown) => /^[0-9]{6,15}$/.test(normalizeTransferNumber(s));
 const safeEqual = (a: string, b: string) => {
   const aa = Buffer.from(a); const bb = Buffer.from(b);
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
@@ -106,176 +105,64 @@ function adminMiddleware(req: AuthedRequest, res: Response, next: NextFunction) 
 }
 
 function paymentWebhookMiddleware(req: AuthedRequest, res: Response, next: NextFunction) {
+  const raw = (req.rawBody || Buffer.from(JSON.stringify(req.body || {}))).toString('utf8');
+  const parserSignature = req.header('x-webhook-signature-v2') || '';
+  const parserTimestamp = req.header('x-webhook-timestamp') || '';
+  const parserEventId = req.header('x-webhook-event-id') || '';
+
+  if (parserSignature || parserTimestamp || parserEventId) {
+    const timestamp = Number(parserTimestamp);
+    const eventId = parserEventId || null;
+    const signature = parserSignature.replace(/^sha256=/i, '');
+    void flowLog({ stage: 'WEBHOOK_RECEIVED', status: 'PARSER_HEADERS', eventId, details: {
+      path: req.path, has_signature: Boolean(parserSignature), has_timestamp: Boolean(parserTimestamp), has_event_id: Boolean(parserEventId),
+      timestamp, body_bytes: Buffer.byteLength(raw, 'utf8')
+    }});
+
+    if (!PARSER_WEBHOOK_SECRET) {
+      void flowLog({ level:'ERROR', stage:'WEBHOOK_AUTH', status:'REJECTED_NO_SECRET', eventId, details:{ reason:'PARSER_WEBHOOK_SECRET missing' }});
+      return res.status(500).json({ error: 'parser_webhook_secret_missing' });
+    }
+    if (!parserSignature || !parserTimestamp || !Number.isFinite(timestamp)) {
+      void flowLog({ level:'WARN', stage:'WEBHOOK_AUTH', status:'REJECTED_MISSING_HEADERS', eventId, details:{ has_signature:Boolean(parserSignature), has_timestamp:Boolean(parserTimestamp), has_event_id:Boolean(parserEventId) }});
+      return res.status(401).json({ error: 'signature_required' });
+    }
+    if (Math.abs(Math.floor(Date.now() / 1000) - timestamp) > WEBHOOK_MAX_SKEW_SEC) {
+      void flowLog({ level:'WARN', stage:'WEBHOOK_AUTH', status:'REJECTED_EXPIRED', eventId, details:{ timestamp, skew_seconds:Math.abs(Math.floor(Date.now()/1000)-timestamp), max_skew:WEBHOOK_MAX_SKEW_SEC }});
+      return res.status(401).json({ error: 'signature_expired' });
+    }
+    const expected = hmac(PARSER_WEBHOOK_SECRET, `${parserTimestamp}.${raw}`);
+    if (!safeEqual(signature, expected)) {
+      void flowLog({ level:'ERROR', stage:'WEBHOOK_AUTH', status:'REJECTED_BAD_SIGNATURE', eventId, details:{ signature_format: parserSignature.startsWith('sha256=') ? 'sha256-prefixed' : 'hex', body_bytes:Buffer.byteLength(raw,'utf8') }});
+      return res.status(401).json({ error: 'invalid_signature' });
+    }
+    (req as any).paymentWebhookProvider = 'parser';
+    (req as any).paymentWebhookEventId = eventId;
+    void flowLog({ stage:'WEBHOOK_AUTH', status:'ACCEPTED', eventId, details:{ provider:'parser', event:req.body?.event || null }});
+    return next();
+  }
+
+  // Backward-compatible direct payment webhook used by local/admin tests.
   const secret = process.env.PAYMENT_WEBHOOK_SECRET || SESSION_SECRET;
   const signature = req.header('x-synthesisone-signature') || '';
   const timestamp = req.header('x-synthesisone-timestamp') || '';
   const unix = Number(timestamp);
-  if (!signature || !timestamp || !Number.isFinite(unix)) return res.status(401).json({ error: 'signature_required' });
-  if (Math.abs(Math.floor(Date.now() / 1000) - unix) > WEBHOOK_MAX_SKEW_SEC) return res.status(401).json({ error: 'signature_expired' });
-  const raw = (req.rawBody || Buffer.from(JSON.stringify(req.body || {}))).toString('utf8');
-  const expected = `sha256=${hmac(secret, `${timestamp}.${raw}`)}`;
-  if (!safeEqual(signature, expected)) return res.status(401).json({ error: 'invalid_signature' });
-  next();
-}
-
-function isParserWebhookRequest(req: Request) {
-  return Boolean(
-    req.header('x-webhook-event-id') ||
-    req.header('x-webhook-signature-v2') ||
-    req.header('x-webhook-signature')
-  );
-}
-
-function verifyParserWebhook(req: AuthedRequest, res: Response) {
-  if (!PARSER_WEBHOOK_SECRET) {
-    res.status(500).json({ error: 'parser_webhook_secret_not_configured' });
-    return false;
-  }
-
-  const signatureV2 = req.header('x-webhook-signature-v2') || '';
-  const signatureV1 = req.header('x-webhook-signature') || '';
-  const timestamp = req.header('x-webhook-timestamp') || '';
-  const eventId = req.header('x-webhook-event-id') || '';
-  const unix = Number(timestamp);
-
-  if (!timestamp || !Number.isFinite(unix) || !eventId || (!signatureV2 && !signatureV1)) {
-    res.status(401).json({ error: 'parser_webhook_signature_required' });
-    return false;
+  if (!signature || !timestamp || !Number.isFinite(unix)) {
+    void flowLog({ level:'WARN', stage:'WEBHOOK_AUTH', status:'REJECTED_MISSING_HEADERS', details:{ provider:'legacy' }});
+    return res.status(401).json({ error: 'signature_required' });
   }
   if (Math.abs(Math.floor(Date.now() / 1000) - unix) > WEBHOOK_MAX_SKEW_SEC) {
-    res.status(401).json({ error: 'parser_webhook_signature_expired' });
-    return false;
+    void flowLog({ level:'WARN', stage:'WEBHOOK_AUTH', status:'REJECTED_EXPIRED', details:{ provider:'legacy', timestamp:unix }});
+    return res.status(401).json({ error: 'signature_expired' });
   }
-
-  const raw = (req.rawBody || Buffer.from(JSON.stringify(req.body || {}))).toString('utf8');
-  const expectedV2 = hmac(PARSER_WEBHOOK_SECRET, `${timestamp}.${raw}`);
-  const expectedV1 = hmac(PARSER_WEBHOOK_SECRET, raw);
-  if (!safeEqual(signatureV2 || signatureV1, signatureV2 ? expectedV2 : expectedV1)) {
-    res.status(401).json({ error: 'invalid_parser_webhook_signature' });
-    return false;
+  const expected = `sha256=${hmac(secret, `${timestamp}.${raw}`)}`;
+  if (!safeEqual(signature, expected)) {
+    void flowLog({ level:'ERROR', stage:'WEBHOOK_AUTH', status:'REJECTED_BAD_SIGNATURE', details:{ provider:'legacy' }});
+    return res.status(401).json({ error: 'invalid_signature' });
   }
-  return true;
-}
-
-function parserEventParts(req: AuthedRequest) {
-  const payload = req.body || {};
-  const transaction = payload.transaction || {};
-  const rawTransferNumber = normalizeDigits(transaction.sender_phone);
-  return {
-    payload,
-    eventId: String(req.header('x-webhook-event-id') || payload.event_id || '').trim(),
-    transferNumber: normalizeCubaPhone(rawTransferNumber),
-    transferNumberCandidates: transferNumberCandidates(rawTransferNumber),
-    amount: Number(transaction.amount),
-    currency: String(transaction.currency || '').toUpperCase(),
-    transactionId: String(transaction.transaction_id || '').trim(),
-  };
-}
-
-async function deliverTicket(ticket: any, providerReference: string, res: Response) {
-  const { data: claimed, error: claimError } = await supabase.from('payment_tickets').update({
-    status: 'processing',
-    provider_reference: providerReference || null,
-    delivery_attempts: (ticket.delivery_attempts || 0) + 1,
-    last_error: null,
-  }).eq('id', ticket.id).eq('status', 'pending').select('*').single();
-
-  if (claimError || !claimed) return res.status(409).json({ error: 'ticket_already_claimed' });
-
-  try {
-    const { data: files, error: fileQueryError } = await supabase.from('pool_files').select('*')
-      .eq('plan_id', ticket.plan_id).eq('active', true).order('created_at');
-    if (fileQueryError) throw fileQueryError;
-    const available = files || [];
-    if (!available.length) throw new Error('No file available for this plan');
-    const file = available[Math.floor(Math.random() * available.length)];
-    const { data: blob, error: storageError } = await supabase.storage.from(BUCKET).download(file.storage_path);
-    if (storageError || !blob) throw new Error(storageError?.message || 'Pool file unavailable');
-
-    const sent = await bot.telegram.sendDocument(String(ticket.telegram_id), {
-      source: Buffer.from(await blob.arrayBuffer()),
-      filename: file.file_name
-    }, { caption: `✅ Pago confirmado · ${Number(ticket.amount_cup).toFixed(2)} CUP\nPlan: ${ticket.plan_id}` });
-
-    const { error: paidError } = await supabase.from('payment_tickets').update({
-      status: 'paid',
-      paid_at: new Date().toISOString(),
-      delivered_file_id: file.id,
-      last_error: null,
-    }).eq('id', ticket.id).eq('status', 'processing');
-    if (paidError) throw paidError;
-
-    return res.json({
-      ok: true,
-      ticket_id: ticket.id,
-      telegram_message_id: sent.message_id,
-      delivered_file_id: file.id,
-      provider_reference: providerReference || null,
-    });
-  } catch (error) {
-    await supabase.from('payment_tickets').update({
-      status: 'pending',
-      provider_reference: null,
-      last_error: String(error instanceof Error ? error.message : error),
-    }).eq('id', ticket.id).eq('status', 'processing');
-    console.error(`[payment] delivery failed ticket=${ticket.id}:`, error);
-    return res.status(502).json({ error: 'delivery_failed_retryable' });
-  }
-}
-
-async function handleParserPaymentWebhook(req: AuthedRequest, res: Response) {
-  if (!verifyParserWebhook(req, res)) return;
-
-  const { payload, eventId, transferNumber, transferNumberCandidates: candidates, amount, currency, transactionId } = parserEventParts(req);
-  if (payload.event !== 'TRANSFER_DETECTED') return res.status(400).json({ error: 'unsupported_parser_event' });
-  if (!eventId) return res.status(400).json({ error: 'parser_event_id_required' });
-  if (!validTransferNumber(transferNumber) || !Number.isFinite(amount) || amount <= 0) {
-    return res.status(422).json({ error: 'parser_payment_data_incomplete' });
-  }
-  if (currency && currency !== 'CUP') return res.status(422).json({ error: 'unsupported_currency' });
-
-  const providerReference = `PARSER:${eventId}`;
-  const { data: already, error: duplicateError } = await supabase.from('payment_tickets')
-    .select('id,status,telegram_id,delivered_file_id').eq('provider_reference', providerReference).maybeSingle();
-  if (duplicateError) return res.status(500).json({ error: 'duplicate_check_failed' });
-  if (already) {
-    if (already.status === 'pending') {
-      // A previous attempt may have failed after claiming the ticket. The
-      // failed-delivery path clears provider_reference, but pending tickets
-      // from older builds may still carry it; let the event be retried.
-    } else if (already.status === 'processing') {
-      return res.status(503).json({ error: 'ticket_delivery_in_progress' });
-    } else {
-      return res.json({
-        ok: true,
-        duplicate: true,
-        ticket_id: already.id,
-        status: already.status,
-        telegram_id: String(already.telegram_id),
-        delivered_file_id: already.delivered_file_id || null,
-      });
-    }
-  }
-
-  const now = new Date();
-  const minDate = new Date(now.getTime() - WINDOW_MIN * 60_000).toISOString();
-  const { data: tickets, error: ticketFindError } = await supabase.from('payment_tickets').select('*')
-    .eq('status', 'pending')
-    .in('transfer_number', candidates)
-    .eq('amount_cup', amount)
-    .gte('created_at', minDate)
-    .gt('expires_at', now.toISOString())
-    .order('created_at', { ascending: true })
-    .limit(1);
-  if (ticketFindError) return res.status(500).json({ error: 'ticket_lookup_failed' });
-  const ticket = tickets?.[0];
-  if (!ticket) {
-    console.warn(`[parser-webhook] no pending ticket | transfer=${transferNumber} | amount=${amount} | tx=${transactionId || '—'} | event=${eventId}`);
-    return res.status(503).json({ error: 'no_matching_pending_ticket' });
-  }
-
-  console.log(`[parser-webhook] payment matched | ticket=${ticket.id} | telegram=${ticket.telegram_id} | transfer=${transferNumber} | amount=${amount} | tx=${transactionId || '—'} | event=${eventId}`);
-  return deliverTicket(ticket, providerReference, res);
+  (req as any).paymentWebhookProvider = 'legacy';
+  void flowLog({ stage:'WEBHOOK_AUTH', status:'ACCEPTED', details:{ provider:'legacy' }});
+  next();
 }
 
 function telegramInitDataValid(initData: string) {
@@ -301,7 +188,6 @@ app.get('/api/admin/diagnostics', adminMiddleware, async (_req, res) => {
   const { error: plansError } = await supabase.from('plans').select('id').limit(1);
   const { error: filesError } = await supabase.from('pool_files').select('id').limit(1);
   result.plans = plansError ? { ok: false, code: plansError.code, message: plansError.message } : { ok: true };
-  result.parser_webhook = { configured: Boolean(PARSER_WEBHOOK_SECRET), endpoint: `${BASE}/api/payments/incoming` };
   result.pool_files = filesError ? { ok: false, code: filesError.code, message: filesError.message } : { ok: true };
   try {
     const { data, error } = await supabase.storage.getBucket(BUCKET);
@@ -342,8 +228,7 @@ app.post('/api/tickets', async (req, res) => {
   const sessionTelegramId = verifyTelegramSession(String(req.body?.session_token || ''));
   const telegramId = sessionTelegramId || (ALLOW_TEST_TELEGRAM_ID ? String(req.body?.telegram_id || '') : '');
   const planId = String(req.body?.plan_id || '');
-  const rawNumber = normalizeDigits(req.body?.transfer_number);
-  const number = normalizeCubaPhone(rawNumber);
+  const number = normalizeDigits(req.body?.transfer_number);
   const termsRead = req.body?.terms_read === true || req.body?.terms_read === 'true';
   if (!/^\d+$/.test(telegramId) || !planId || !termsRead || !validTransferNumber(number)) return res.status(400).json({ error: 'Datos incompletos o inválidos.' });
 
@@ -380,48 +265,119 @@ app.post('/api/tickets', async (req, res) => {
   res.json({ ok: true, ticket_id: ticket.id, expires_at: expires, amount_cup: Number(plan.price_cup), bank_name: PAYMENT_BANK_NAME, card: PAYMENT_CARD, confirmation_number: PAYMENT_CONFIRMATION_NUMBER });
 });
 
-app.post('/api/payments/incoming', async (req: AuthedRequest, res: Response, next: NextFunction) => {
-  if (isParserWebhookRequest(req)) return handleParserPaymentWebhook(req, res);
-  return paymentWebhookMiddleware(req, res, async () => {
-    const transferNumber = normalizeCubaPhone(req.body?.transfer_number);
-    const candidates = transferNumberCandidates(req.body?.transfer_number);
-    const amount = Number(req.body?.amount_cup);
-    const providerReference = String(req.body?.provider_reference || '').trim();
-    const recipientCard = normalizeDigits(req.body?.recipient_card || '');
-    const confirmationPhone = normalizeDigits(req.body?.confirmation_phone || '');
+app.post('/api/payments/incoming', paymentWebhookMiddleware, async (req, res) => {
+  const eventId = String((req as any).paymentWebhookEventId || req.header('x-webhook-event-id') || `legacy-${crypto.randomUUID()}`);
+  const provider = String((req as any).paymentWebhookProvider || 'unknown');
+  const body = req.body || {};
+  const transaction = body.transaction && typeof body.transaction === 'object' ? body.transaction : {};
+  const isParserEvent = provider === 'parser' || body.event === 'TRANSFER_DETECTED';
+  const transferNumber = normalizeTransferNumber(isParserEvent ? (transaction.sender_phone || body.sender_phone || body.transfer_number) : body.transfer_number);
+  const amount = Number(isParserEvent ? transaction.amount : body.amount_cup);
+  const providerReference = String(isParserEvent ? (transaction.transaction_id || body.provider_reference || eventId) : (body.provider_reference || '')).trim();
+  const recipientCard = normalizeDigits(isParserEvent ? (transaction.receiver_account || body.merchant_accounts?.card1 || '') : (body.recipient_card || ''));
+  const confirmationPhone = normalizeDigits(isParserEvent ? (transaction.receiver_phone || '') : (body.confirmation_phone || ''));
 
-    if (!validTransferNumber(transferNumber) || !Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'invalid_payment_event' });
-    if (!ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA) {
-      if (!recipientCard || !confirmationPhone) return res.status(400).json({ error: 'recipient_data_required' });
-      if (recipientCard !== normalizeDigits(PAYMENT_CARD) || confirmationPhone !== normalizeDigits(PAYMENT_CONFIRMATION_NUMBER)) return res.status(400).json({ error: 'recipient_mismatch' });
+  await flowLog({ stage:'WEBHOOK_EVENT', status:'RECEIVED', event:body.event || null, eventId, details:{ provider, is_parser_event:isParserEvent, transfer_number:transferNumber, amount, provider_reference:providerReference || null, recipient_card:recipientCard || null, confirmation_phone:confirmationPhone || null, raw_keys:Object.keys(body).sort() }});
+
+  if (isParserEvent && body.event !== 'TRANSFER_DETECTED') {
+    await flowLog({ level:'INFO', stage:'WEBHOOK_EVENT', status:'IGNORED', event:body.event || null, eventId, details:{ reason:'not_transfer_detected' }});
+    return res.json({ ok:true, ignored:true, event:body.event || null });
+  }
+
+  if (!validTransferNumber(transferNumber) || !Number.isFinite(amount) || amount <= 0) {
+    await flowLog({ level:'ERROR', stage:'PAYMENT_VALIDATION', status:'REJECTED', event:body.event || null, eventId, details:{ transfer_number:transferNumber, amount }});
+    return res.status(400).json({ error: 'invalid_payment_event' });
+  }
+
+  // Recipient validation is kept for legacy/manual calls. Parser-bot events are already
+  // tied to the merchant client and carry merchant_accounts metadata when available.
+  if (!isParserEvent && !ALLOW_PAYMENT_EVENT_WITHOUT_RECIPIENT_DATA) {
+    if (!recipientCard || !confirmationPhone) {
+      await flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_DATA', eventId, details:{ reason:'recipient_data_required' }});
+      return res.status(400).json({ error: 'recipient_data_required' });
     }
-
-    if (providerReference) {
-      const { data: already } = await supabase.from('payment_tickets').select('id,status').eq('provider_reference', providerReference).maybeSingle();
-      if (already?.status === 'processing') return res.status(503).json({ error: 'ticket_delivery_in_progress' });
-      if (already && already.status !== 'pending') return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
+    if (recipientCard !== normalizeDigits(PAYMENT_CARD) || confirmationPhone !== normalizeDigits(PAYMENT_CONFIRMATION_NUMBER)) {
+      await flowLog({ level:'WARN', stage:'PAYMENT_VALIDATION', status:'REJECTED_RECIPIENT_MISMATCH', eventId, details:{ recipient_card:recipientCard, confirmation_phone:confirmationPhone }});
+      return res.status(400).json({ error: 'recipient_mismatch' });
     }
+  }
 
-    const customer = (await supabase.from('customers').select('telegram_id,transfer_number').in('transfer_number', candidates).maybeSingle()).data;
-    if (!customer) return res.status(404).json({ error: 'transfer_number_unknown' });
+  if (providerReference) {
+    const { data: already } = await supabase.from('payment_tickets').select('id,status').eq('provider_reference', providerReference).maybeSingle();
+    if (already) {
+      await flowLog({ level:'INFO', stage:'IDEMPOTENCY', status:'DUPLICATE', eventId, ticketId:already.id, details:{ provider_reference:providerReference, existing_status:already.status }});
+      return res.json({ ok: true, duplicate: true, ticket_id: already.id, status: already.status });
+    }
+  }
 
-    const now = new Date();
-    const minDate = new Date(now.getTime() - WINDOW_MIN * 60_000).toISOString();
-    const { data: tickets, error: ticketFindError } = await supabase.from('payment_tickets').select('*')
-      .eq('status', 'pending').eq('telegram_id', String(customer.telegram_id)).in('transfer_number', candidates).eq('amount_cup', amount)
-      .gte('created_at', minDate).gt('expires_at', now.toISOString()).order('created_at', { ascending: true }).limit(1);
-    if (ticketFindError) return res.status(500).json({ error: 'ticket_lookup_failed' });
-    const ticket = tickets?.[0];
-    if (!ticket) return res.status(404).json({ error: 'no_matching_pending_ticket' });
+  const customer = (await supabase.from('customers').select('telegram_id,transfer_number').eq('transfer_number', transferNumber).maybeSingle()).data;
+  if (!customer) {
+    await flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'CUSTOMER_NOT_FOUND', eventId, details:{ transfer_number:transferNumber, amount }});
+    return res.status(404).json({ error: 'transfer_number_unknown' });
+  }
 
-    return deliverTicket(ticket, providerReference || `PAYMENT:${crypto.randomUUID()}`, res);
-  });
+  const now = new Date();
+  const minDate = new Date(now.getTime() - WINDOW_MIN * 60_000).toISOString();
+  const { data: tickets, error: ticketFindError } = await supabase.from('payment_tickets').select('*')
+    .eq('status', 'pending').eq('telegram_id', String(customer.telegram_id)).eq('transfer_number', transferNumber).eq('amount_cup', amount)
+    .gte('created_at', minDate).gt('expires_at', now.toISOString()).order('created_at', { ascending: true }).limit(1);
+  if (ticketFindError) {
+    await flowLog({ level:'ERROR', stage:'TICKET_MATCH', status:'DB_ERROR', eventId, details:{ error:ticketFindError.message }});
+    return res.status(500).json({ error: 'ticket_lookup_failed' });
+  }
+  const ticket = tickets?.[0];
+  if (!ticket) {
+    await flowLog({ level:'WARN', stage:'TICKET_MATCH', status:'NO_PENDING_MATCH', eventId, telegramId:String(customer.telegram_id), details:{ transfer_number:transferNumber, amount, window_minutes:WINDOW_MIN }});
+    return res.status(404).json({ error: 'no_matching_pending_ticket' });
+  }
+
+  await flowLog({ stage:'TICKET_MATCH', status:'MATCHED', eventId, ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ transfer_number:transferNumber, amount, plan_id:ticket.plan_id, ticket_created_at:ticket.created_at }});
+
+  const { data: claimed, error: claimError } = await supabase.from('payment_tickets').update({
+    status: 'processing', provider_reference: providerReference || null, delivery_attempts: (ticket.delivery_attempts || 0) + 1
+  }).eq('id', ticket.id).eq('status', 'pending').select('*').single();
+  if (claimError || !claimed) {
+    await flowLog({ level:'WARN', stage:'TICKET_CLAIM', status:'ALREADY_CLAIMED', eventId, ticketId:ticket.id, details:{ error:claimError?.message || 'no_row_updated' }});
+    return res.status(409).json({ error: 'ticket_already_claimed' });
+  }
+  await flowLog({ stage:'TICKET_CLAIM', status:'PROCESSING', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ provider_reference:providerReference }});
+
+  try {
+    const { data: files, error: filesError } = await supabase.from('pool_files').select('*').eq('plan_id', claimed.plan_id).eq('active', true).order('created_at');
+    if (filesError) throw filesError;
+    const available = files || [];
+    if (!available.length) throw new Error('No file available for this plan');
+    const file = available[Math.floor(Math.random() * available.length)];
+    await flowLog({ stage:'FILE_SELECTION', status:'SELECTED', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name, storage_path:file.storage_path, available_count:available.length }});
+
+    const { data: blob, error: storageError } = await supabase.storage.from(BUCKET).download(file.storage_path);
+    if (storageError || !blob) throw new Error(storageError?.message || 'Pool file unavailable');
+    const bytes = Buffer.from(await blob.arrayBuffer());
+    await flowLog({ stage:'FILE_DOWNLOAD', status:'READY', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, bytes:bytes.length }});
+
+    await flowLog({ stage:'TELEGRAM_SEND', status:'START', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ file_id:file.id, file_name:file.file_name }});
+    const sent = await bot.telegram.sendDocument(String(claimed.telegram_id), {
+      source: bytes, filename: file.file_name
+    }, { caption: `✅ Pago confirmado · ${Number(claimed.amount_cup).toFixed(2)} CUP\nPlan: ${claimed.plan_id}` });
+
+    await flowLog({ stage:'TELEGRAM_SEND', status:'SUCCESS', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ telegram_message_id:sent.message_id, file_id:file.id }});
+
+    const { error: paidError } = await supabase.from('payment_tickets').update({
+      status: 'paid', paid_at: now.toISOString(), delivered_file_id: file.id, last_error: null
+    }).eq('id', claimed.id).eq('status', 'processing');
+    if (paidError) {
+      await flowLog({ level:'ERROR', stage:'TICKET_FINALIZE', status:'DB_ERROR_AFTER_TELEGRAM', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:paidError.message }});
+      throw paidError;
+    }
+    await flowLog({ stage:'TICKET_FINALIZE', status:'PAID', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ delivered_file_id:file.id, telegram_message_id:sent.message_id }});
+    return res.json({ ok: true, ticket_id: claimed.id, telegram_message_id: sent.message_id, delivered_file_id: file.id, event_id:eventId });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await supabase.from('payment_tickets').update({ status:'pending', last_error:message }).eq('id', claimed.id).eq('status','processing');
+    await flowLog({ level:'ERROR', stage:'PAYMENT_FLOW', status:'RETRYABLE_FAILURE', eventId, ticketId:claimed.id, telegramId:String(claimed.telegram_id), details:{ error:message }});
+    return res.status(502).json({ error:'delivery_failed_retryable', event_id:eventId, detail:message });
+  }
 });
-
-// Alias explicitly named for the standard parser-to-client webhook contract.
-// The existing /api/payments/incoming route also accepts this contract so an
-// already-registered parser webhook URL does not have to be changed.
-app.post('/api/payments/parser-webhook', handleParserPaymentWebhook);
 
 app.post('/api/admin/login', async (req, res) => {
   const password = String(req.body?.password || '');
@@ -431,6 +387,15 @@ app.post('/api/admin/login', async (req, res) => {
   res.json({ ok: true, token });
 });
 app.post('/api/admin/logout', adminMiddleware, (req: AuthedRequest, res) => { if (req.adminSession) adminSessions.delete(req.adminSession); res.json({ ok: true }); });
+app.get('/api/admin/payment-flow-logs', adminMiddleware, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
+  let query = supabase.from('payment_flow_logs').select('*').order('created_at', { ascending:false }).limit(limit);
+  if (req.query.ticket_id) query = query.eq('ticket_id', String(req.query.ticket_id));
+  if (req.query.event_id) query = query.eq('event_id', String(req.query.event_id));
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error:'payment_flow_logs_unavailable', detail:error.message });
+  res.json(data || []);
+});
 app.get('/api/admin/tickets', adminMiddleware, async (_req, res) => {
   const { data, error } = await supabase.from('payment_tickets').select('*,plans(name,price_cup)').order('created_at', { ascending: false }).limit(300);
   if (error) return res.status(500).json({ error: 'tickets_unavailable' }); res.json(data || []);
@@ -599,6 +564,38 @@ app.delete('/api/admin/files/:id', adminMiddleware, async (req, res) => {
   await supabase.from('pool_files').delete().eq('id', file.id);
   res.json({ ok: true });
 });
+app.post('/api/admin/test-parser/:ticketId', adminMiddleware, async (req, res) => {
+  if (!PARSER_WEBHOOK_SECRET) return res.status(500).json({ error:'parser_webhook_secret_missing' });
+  const { data: ticket, error: ticketError } = await supabase.from('payment_tickets').select('*').eq('id', req.params.ticketId).single();
+  if (ticketError || !ticket) return res.status(404).json({ error:'ticket_not_found' });
+
+  const body = JSON.stringify({
+    schema_version:'1.0',
+    event:'TRANSFER_DETECTED',
+    event_id:`TEST-PARSER-${ticket.id}-${Date.now()}`,
+    occurred_at:new Date().toISOString(),
+    client:{ id:'test-client', name:'Parser Test', phone_number:null, expires_at:null },
+    merchant_accounts:{ card1:PAYMENT_CARD, card2:null, card3:null, wallet:null },
+    sms:{ sender:'TEST', body:'TEST TRANSFER', received_at:new Date().toISOString(), message_id:null, log_id:null },
+    verification:{ is_financial_transfer:true, has_amount:true, has_currency:true, has_transaction_id:true, has_destination_account:false, has_destination_phone:false, has_counterparty_phone:true },
+    transaction:{ direction:'RECIBIDO', type:'TEST', network:'PAGOMOVIL', amount:Number(ticket.amount_cup), currency:'CUP', sender_phone:ticket.transfer_number, receiver_phone:null, receiver_account:PAYMENT_CARD, transaction_id:`TEST-${ticket.id}`, balance_after:null }
+  });
+  const timestamp=String(Math.floor(Date.now()/1000));
+  const signature=hmac(PARSER_WEBHOOK_SECRET, `${timestamp}.${body}`);
+  const target=`${BASE}/api/payments/incoming`;
+  await flowLog({ stage:'TEST_PARSER', status:'START', eventId:JSON.parse(body).event_id, ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ target, transfer_number:ticket.transfer_number, amount:Number(ticket.amount_cup) }});
+  try {
+    const response=await fetch(target,{ method:'POST', headers:{'Content-Type':'application/json','X-Webhook-Event-Id':JSON.parse(body).event_id,'X-Webhook-Timestamp':timestamp,'X-Webhook-Signature':signature,'X-Webhook-Signature-V2':signature,'User-Agent':'SynthesisOne-Parser-Test/1.0'}, body });
+    const text=await response.text();
+    await flowLog({ level:response.ok?'INFO':'ERROR', stage:'TEST_PARSER', status:response.ok?'SUCCESS':'HTTP_ERROR', eventId:JSON.parse(body).event_id, ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ http_status:response.status, response:text.slice(0,8000) }});
+    res.status(response.ok?200:502).json({ ok:response.ok, http_status:response.status, response:text.slice(0,8000) });
+  } catch(error) {
+    const detail=error instanceof Error?error.message:String(error);
+    await flowLog({ level:'ERROR', stage:'TEST_PARSER', status:'FETCH_EXCEPTION', ticketId:ticket.id, telegramId:String(ticket.telegram_id), details:{ error:detail, target }});
+    res.status(502).json({ error:'test_parser_failed', detail });
+  }
+});
+
 app.post('/api/admin/test-payment/:ticketId', adminMiddleware, async (req, res) => {
   const { data: ticket } = await supabase.from('payment_tickets').select('*').eq('id', req.params.ticketId).single();
   if (!ticket) return res.status(404).json({ error: 'ticket_not_found' });
@@ -609,52 +606,6 @@ app.post('/api/admin/test-payment/:ticketId', adminMiddleware, async (req, res) 
   const target = `${BASE}/api/payments/incoming`;
   try {
     const response = await fetch(target, { method: 'POST', headers: { 'content-type': 'application/json', 'x-synthesisone-timestamp': timestamp, 'x-synthesisone-signature': signature }, body });
-    const json = await response.json();
-    res.status(response.status).json(json);
-  } catch (error) { res.status(502).json({ error: String(error) }); }
-});
-
-app.post('/api/admin/test-parser-payment/:ticketId', adminMiddleware, async (req, res) => {
-  if (!PARSER_WEBHOOK_SECRET) return res.status(500).json({ error: 'parser_webhook_secret_not_configured' });
-  const { data: ticket } = await supabase.from('payment_tickets').select('*').eq('id', req.params.ticketId).single();
-  if (!ticket) return res.status(404).json({ error: 'ticket_not_found' });
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const eventId = `TEST-PARSER-${ticket.id}`;
-  const body = JSON.stringify({
-    schema_version: '1.0',
-    event: 'TRANSFER_DETECTED',
-    event_id: eventId,
-    occurred_at: new Date().toISOString(),
-    client: { id: 'TEST', name: 'SynthesisOne Telegram Shop Test' },
-    sms: { sender: 'TEST', body: `TEST payment ${ticket.amount_cup} CUP from ${ticket.transfer_number}`, received_at: new Date().toISOString() },
-    verification: { is_financial_transfer: true, has_amount: true, has_currency: true, has_counterparty_phone: true },
-    transaction: {
-      direction: 'RECIBIDO',
-      type: 'MONEDERO_MONEDERO',
-      network: 'PAGOMOVIL',
-      amount: Number(ticket.amount_cup),
-      currency: 'CUP',
-      sender_phone: ticket.transfer_number,
-      receiver_phone: null,
-      receiver_account: null,
-      transaction_id: `TEST-TX-${ticket.id}`
-    }
-  });
-  const signatureV1 = hmac(PARSER_WEBHOOK_SECRET, body);
-  const signatureV2 = hmac(PARSER_WEBHOOK_SECRET, `${timestamp}.${body}`);
-  const target = `${BASE}/api/payments/incoming`;
-  try {
-    const response = await fetch(target, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-webhook-event-id': eventId,
-        'x-webhook-timestamp': timestamp,
-        'x-webhook-signature': signatureV1,
-        'x-webhook-signature-v2': signatureV2
-      },
-      body
-    });
     const json = await response.json();
     res.status(response.status).json(json);
   } catch (error) { res.status(502).json({ error: String(error) }); }
